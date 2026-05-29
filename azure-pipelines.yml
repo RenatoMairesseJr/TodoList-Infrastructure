@@ -1,0 +1,244 @@
+trigger:
+  - main
+  - develop
+
+pr:
+  - main
+  - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+  nodeVersion: '18.x'
+  dotnetVersion: '8.x'
+
+stages:
+  - stage: Build
+    displayName: 'Build Applications'
+    jobs:
+      - job: BuildDotNetAPI
+        displayName: 'Build .NET API'
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Use .NET 8'
+            inputs:
+              version: $(dotnetVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore NuGet packages'
+            inputs:
+              command: 'restore'
+              projects: '**/ToDoApi.csproj'
+              feedsToUse: 'select'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Build'
+            inputs:
+              command: 'build'
+              projects: '**/ToDoApi.csproj'
+              arguments: '--configuration $(buildConfiguration) --no-restore'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Publish'
+            inputs:
+              command: 'publish'
+              projects: '**/ToDoApi.csproj'
+              arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/dotnet'
+              zipAfterPublish: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish .NET Artifacts'
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/dotnet'
+              artifactName: 'dotnet-api'
+
+      - job: BuildReactApp
+        displayName: 'Build React App'
+        steps:
+          - task: NodeTool@0
+            displayName: 'Use Node.js $(nodeVersion)'
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: npm ci
+            displayName: 'Install dependencies'
+            workingDirectory: 'Frontend-React'
+
+          - script: npm run build
+            displayName: 'Build React app'
+            workingDirectory: 'Frontend-React'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish React Artifacts'
+            inputs:
+              pathToPublish: 'Frontend-React/dist'
+              artifactName: 'react-app'
+
+      - job: BicepValidation
+        displayName: 'Validate Bicep Templates'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Validate Bicep template'
+            inputs:
+              azureSubscription: 'Azure Subscription'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az bicep build --file bicep/main.bicep
+                echo "Bicep template validation successful"
+
+  - stage: Deploy_Dev
+    displayName: 'Deploy to Dev'
+    dependsOn: Build
+    condition: succeeded()
+    variables:
+      resourceGroupName: 'rg-todolist-dev'
+      environment: 'dev'
+      appServicePlanSku: 'B1'
+
+    jobs:
+      - deployment: DeployInfrastructure
+        displayName: 'Deploy Infrastructure'
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureResourceManagerTemplateDeployment@3
+                  displayName: 'Deploy Bicep template'
+                  inputs:
+                    deploymentScope: 'Resource Group'
+                    azureResourceManagerConnection: 'Azure Subscription'
+                    subscriptionId: '$(AZURE_SUBSCRIPTION_ID)'
+                    action: 'Create Or Update Resource Group'
+                    resourceGroupName: $(resourceGroupName)
+                    location: 'East US'
+                    templateLocation: 'Linked artifact'
+                    csmFile: '$(System.DefaultWorkingDirectory)/bicep/main.bicep'
+                    overrideParameters: |
+                      -environment $(environment)
+                      -appServicePlanSku $(appServicePlanSku)
+                    deploymentMode: 'Incremental'
+
+      - deployment: DeployDotNetAPI
+        displayName: 'Deploy .NET API'
+        dependsOn: DeployInfrastructure
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'dotnet-api'
+                  displayName: 'Download .NET artifacts'
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to App Service'
+                  inputs:
+                    azureSubscription: 'Azure Subscription'
+                    appType: 'webAppLinux'
+                    appName: 'todoapi-dev-*'
+                    package: '$(Pipeline.Workspace)/dotnet-api/**/*.zip'
+                    runtimeStack: 'DOTNETCORE|8.0'
+
+      - deployment: DeployReactApp
+        displayName: 'Deploy React Frontend'
+        dependsOn: DeployInfrastructure
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'react-app'
+                  displayName: 'Download React artifacts'
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to App Service'
+                  inputs:
+                    azureSubscription: 'Azure Subscription'
+                    appType: 'webAppLinux'
+                    appName: 'todoweb-dev-*'
+                    package: '$(Pipeline.Workspace)/react-app'
+                    runtimeStack: 'NODE|18-lts'
+
+  - stage: Deploy_Prod
+    displayName: 'Deploy to Production'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    variables:
+      resourceGroupName: 'rg-todolist-prod'
+      environment: 'prod'
+      appServicePlanSku: 'B2'
+
+    jobs:
+      - deployment: DeployInfrastructure
+        displayName: 'Deploy Infrastructure'
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureResourceManagerTemplateDeployment@3
+                  displayName: 'Deploy Bicep template'
+                  inputs:
+                    deploymentScope: 'Resource Group'
+                    azureResourceManagerConnection: 'Azure Subscription'
+                    subscriptionId: '$(AZURE_SUBSCRIPTION_ID)'
+                    action: 'Create Or Update Resource Group'
+                    resourceGroupName: $(resourceGroupName)
+                    location: 'East US'
+                    templateLocation: 'Linked artifact'
+                    csmFile: '$(System.DefaultWorkingDirectory)/bicep/main.bicep'
+                    overrideParameters: |
+                      -environment $(environment)
+                      -appServicePlanSku $(appServicePlanSku)
+                    deploymentMode: 'Incremental'
+
+      - deployment: DeployDotNetAPI
+        displayName: 'Deploy .NET API'
+        dependsOn: DeployInfrastructure
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'dotnet-api'
+                  displayName: 'Download .NET artifacts'
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to App Service'
+                  inputs:
+                    azureSubscription: 'Azure Subscription'
+                    appType: 'webAppLinux'
+                    appName: 'todoapi-prod-*'
+                    package: '$(Pipeline.Workspace)/dotnet-api/**/*.zip'
+                    runtimeStack: 'DOTNETCORE|8.0'
+
+      - deployment: DeployReactApp
+        displayName: 'Deploy React Frontend'
+        dependsOn: DeployInfrastructure
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'react-app'
+                  displayName: 'Download React artifacts'
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to App Service'
+                  inputs:
+                    azureSubscription: 'Azure Subscription'
+                    appType: 'webAppLinux'
+                    appName: 'todoweb-prod-*'
+                    package: '$(Pipeline.Workspace)/react-app'
+                    runtimeStack: 'NODE|18-lts'
